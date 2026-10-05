@@ -12,7 +12,7 @@ API_URL = os.getenv(
     "SCORE_API_URL",
     "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
 )
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_SECONDS", "15"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_SECONDS", "5"))
 
 log = logging.getLogger("scoredisplay")
 
@@ -46,8 +46,23 @@ def parse(data: dict) -> list[dict]:
                 "timeouts": situation.get(f"{side}Timeouts"),
             }
         if "home" in game and "away" in game:
+            game["ball_pct"] = ball_position(situation.get("possessionText", ""), game)
+            game["ball_text"] = situation.get("possessionText", "")
             games.append(game)
     return games
+
+
+def ball_position(text: str, game: dict) -> float | None:
+    """Map text like 'DEN 35' to 0-100 from the away end zone to the home end zone."""
+    parts = text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return None
+    abbr, yard = parts[0], int(parts[1])
+    if abbr == game["away"]["abbr"]:
+        return float(yard)
+    if abbr == game["home"]["abbr"]:
+        return float(100 - yard)
+    return 50.0 if yard == 50 else None
 
 
 async def fetch_games(client: httpx.AsyncClient) -> list[dict]:
@@ -98,27 +113,42 @@ PAGE = """<!doctype html>
 body{font-family:sans-serif;background:#111;color:#eee;margin:2rem}
 h2{margin:1.5rem 0 .5rem}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:1rem}
-.game{background:#1c1c1c;border:1px solid #444;border-radius:10px;padding:1rem}
+.game{background:#1c1c1c;border:1px solid #444;border-radius:10px;padding:.6rem}
 .game.live{border-color:#3c3}
-.teams{display:flex;align-items:flex-start;justify-content:space-between;gap:.5rem}
+.teams{display:flex;align-items:stretch;justify-content:space-between;gap:.5rem}
 .team{width:5.5rem;text-align:center}
 .team img{width:64px;height:64px;object-fit:contain}
 .abbr{font-weight:bold}
 .to{letter-spacing:.2rem;color:#fc3;min-height:1.2rem}
-.mid{flex:1;text-align:center}
+.mid{flex:1;text-align:center;display:flex;flex-direction:column}
+.mid .field{margin-top:auto}
 .scores{display:flex;justify-content:center;gap:.8rem;font-size:2.2rem;font-weight:bold;align-items:center}
 .scores span.poss{color:#fc3}
 .down{color:#fc3;min-height:1.2rem}
-.clock{color:#9ab;margin-top:.3rem}
+.clock{color:#9ab;margin-top:.1rem}
+.ball{color:#9ab;font-size:.8rem;margin-bottom:.4rem}
+.has-ball .abbr::after{content:" \\1F3C8"}
+.field{position:relative;height:14px;margin-top:.3rem;border-radius:4px;border:1px solid #2a5;
+  background:linear-gradient(90deg,#363 0,#363 10%,#2a6a2a 10%,#2a6a2a 90%,#363 90%)}
+.field .mark{position:absolute;top:-3px;font-size:14px;transform:translateX(-50%);line-height:1;white-space:nowrap;color:#fc3}
+.fieldtxt{text-align:center;font-size:.8rem;color:#9ab}
 #meta{color:#888}
 </style></head>
 <body><h1>Scores</h1><div id="meta"></div><div id="games"></div>
 <script>
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const ORD = ['', '1st', '2nd', '3rd', '4th'];
-function team(t) {
+function team(t, hasBall) {
   const to = t.timeouts == null ? '' : '\u25CF'.repeat(t.timeouts);
-  return `<div class="team"><img src="${esc(t.logo)}" alt=""><div class="abbr">${esc(t.abbr)}</div><div class="to">${to}</div></div>`;
+  return `<div class="team ${hasBall ? 'has-ball' : ''}"><img src="${esc(t.logo)}" alt=""><div class="abbr">${esc(t.abbr)}</div><div class="to">${to}</div></div>`;
+}
+function field(g) {
+  if (g.state !== 'in' || g.ball_pct == null) return '';
+  const pct = 10 + g.ball_pct * 0.8;
+  const right = g.possession === g.away.id;
+  const ball = '\\u{1F3C8}';
+  const mark = right ? ball + '\u25B6' : '\u25C0' + ball;
+  return `<div class="field"><span class="mark" style="left:${pct}%">${mark}</span></div>`;
 }
 function tile(g) {
   let down = '', clock;
@@ -131,10 +161,11 @@ function tile(g) {
     clock = g.detail;
   }
   const show = g.state !== 'pre';
+  const live = g.state === 'in';
   return `<div class="game ${g.state === 'in' ? 'live' : ''}">` +
-    `<div class="teams">${team(g.away)}<div class="mid">` +
+    `<div class="teams">${team(g.away, live && g.possession === g.away.id)}<div class="mid">` +
     `<div class="scores"><span>${show ? esc(g.away.score) : ''}</span><span>${show ? '-' : '@'}</span><span>${show ? esc(g.home.score) : ''}</span></div>` +
-    `<div class="down">${esc(down)}</div><div class="clock">${esc(clock)}</div></div>${team(g.home)}</div></div>`;
+    `<div class="down">${esc(down)}</div><div class="clock">${esc(clock)}</div>${g.state === 'in' && g.ball_text ? `<div class="ball">Ball on ${esc(g.ball_text)}</div>` : ''}${field(g)}</div>${team(g.home, live && g.possession === g.home.id)}</div></div>`;
 }
 async function refresh(){
   try{
