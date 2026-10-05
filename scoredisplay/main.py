@@ -3,6 +3,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI
@@ -13,6 +14,8 @@ API_URL = os.getenv(
     "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
 )
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_SECONDS", "5"))
+IDLE_INTERVAL = float(os.getenv("IDLE_INTERVAL_SECONDS", "3600"))
+KICKOFF_LEAD = float(os.getenv("KICKOFF_LEAD_SECONDS", "900"))
 
 log = logging.getLogger("scoredisplay")
 
@@ -85,17 +88,54 @@ async def fetch_games(client: httpx.AsyncClient) -> list[dict]:
     return games
 
 
+def next_delay(games: list[dict]) -> float:
+    """Fast while games are live or about to start; otherwise sleep until just before the next kickoff."""
+    now = datetime.now(timezone.utc)
+    delay = IDLE_INTERVAL
+    for g in games:
+        if g["state"] == "in":
+            return POLL_INTERVAL
+        if g["state"] != "pre":
+            continue
+        try:
+            start = datetime.fromisoformat(g["date"].replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        until_wake = (start - now).total_seconds() - KICKOFF_LEAD
+        if until_wake <= 0:
+            return POLL_INTERVAL
+        delay = min(delay, until_wake)
+    return max(delay, POLL_INTERVAL)
+
+
+async def sleep_until(deadline: float) -> None:
+    """Sleep in short steps against the wall clock so a suspend/resume doesn't stretch the wait."""
+    while (remaining := deadline - time.time()) > 0:
+        await asyncio.sleep(min(remaining, 30))
+
+
+poll_lock = asyncio.Lock()
+
+
+async def poll_once(client: httpx.AsyncClient) -> float:
+    """Fetch from the API, update state, and return the delay before the next scheduled poll."""
+    async with poll_lock:
+        try:
+            state["games"] = await fetch_games(client)
+            state["updated"] = time.time()
+            state["error"] = None
+            return next_delay(state["games"])
+        except Exception as exc:  # keep the service alive on any failure
+            log.warning("poll failed: %s", exc)
+            state["error"] = str(exc)
+            return POLL_INTERVAL
+
+
 async def poll_forever() -> None:
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
-            try:
-                state["games"] = await fetch_games(client)
-                state["updated"] = time.time()
-                state["error"] = None
-            except Exception as exc:  # keep the service alive on any failure
-                log.warning("poll failed: %s", exc)
-                state["error"] = str(exc)
-            await asyncio.sleep(POLL_INTERVAL)
+            delay = await poll_once(client)
+            await sleep_until(time.time() + delay)
 
 
 @asynccontextmanager
@@ -132,9 +172,10 @@ h2{margin:1.5rem 0 .5rem}
   background:linear-gradient(90deg,#363 0,#363 10%,#2a6a2a 10%,#2a6a2a 90%,#363 90%)}
 .field .mark{position:absolute;top:-3px;font-size:14px;transform:translateX(-50%);line-height:1;white-space:nowrap;color:#fc3}
 .fieldtxt{text-align:center;font-size:.8rem;color:#9ab}
-#meta{color:#888}
+#meta{color:#888;display:inline}
+#refresh{color:#9ab;margin-left:.5rem}
 </style></head>
-<body><h1>Scores</h1><div id="meta"></div><div id="games"></div>
+<body><h1>Scores</h1><div id="meta"></div> <a href="#" id="refresh">Refresh</a><div id="games"></div>
 <script>
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const ORD = ['', '1st', '2nd', '3rd', '4th'];
@@ -167,9 +208,9 @@ function tile(g) {
     `<div class="scores"><span>${show ? esc(g.away.score) : ''}</span><span>${show ? '-' : '@'}</span><span>${show ? esc(g.home.score) : ''}</span></div>` +
     `<div class="down">${esc(down)}</div><div class="clock">${esc(clock)}</div>${g.state === 'in' && g.ball_text ? `<div class="ball">Ball on ${esc(g.ball_text)}</div>` : ''}${field(g)}</div>${team(g.home, live && g.possession === g.home.id)}</div></div>`;
 }
-async function refresh(){
+async function refresh(path = '/api/scores', opts = {}){
   try{
-    const d = await (await fetch('/api/scores')).json();
+    const d = await (await fetch(path, opts)).json();
     const byDate = (a, b) => a.date.localeCompare(b.date);
     const sections = [
       ['Live', d.games.filter(g => g.state === 'in').sort(byDate)],
@@ -183,6 +224,11 @@ async function refresh(){
   }catch(e){document.getElementById('meta').textContent='Connection lost';}
 }
 refresh(); setInterval(refresh, 5000);
+document.getElementById('refresh').onclick = e => {
+  e.preventDefault();
+  document.getElementById('meta').textContent = 'Refreshing...';
+  refresh('/api/refresh', {method: 'POST'});
+};
 </script></body></html>"""
 
 
@@ -193,4 +239,11 @@ async def index() -> str:
 
 @app.get("/api/scores")
 async def scores() -> dict:
+    return state
+
+
+@app.post("/api/refresh")
+async def refresh_now() -> dict:
+    async with httpx.AsyncClient(timeout=10) as client:
+        await poll_once(client)
     return state
